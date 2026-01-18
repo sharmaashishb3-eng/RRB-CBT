@@ -20,7 +20,8 @@ type Provider = 'perplexity' | 'openrouter';
 async function callProvider(
     provider: Provider,
     subject: Subject,
-    category: 'technical' | 'non_technical'
+    category: 'technical' | 'non_technical',
+    attempt: number
 ) {
     const isPerplexity = provider === 'perplexity';
     const apiKey = isPerplexity ? PERPLEXITY_API_KEY : OPENROUTER_API_KEY;
@@ -28,8 +29,13 @@ async function callProvider(
         ? 'https://api.perplexity.ai/chat/completions'
         : 'https://openrouter.ai/api/v1/chat/completions';
 
-    // Claude 3.5 Sonnet is the gold standard for high-accuracy JSON generation
-    const model = isPerplexity ? 'sonar' : 'anthropic/claude-3.5-sonnet';
+    // 3-Tier Model Rotation to handle Credits (Error 402) and Rate Limits
+    const models = isPerplexity 
+        ? ['sonar'] 
+        : ['anthropic/claude-3.5-sonnet', 'google/gemini-flash-1.5', 'meta-llama/llama-3.1-8b-instruct'];
+    
+    // Use attempt to rotate models if needed
+    const model = models[(attempt - 1) % models.length];
 
     const prompt = `Generate exactly ${subject.marks} multiple choice questions for "${subject.name}" (RRB JE level).
 Topics: ${subject.topics.join(', ')}.
@@ -64,7 +70,7 @@ Structure PER QUESTION:
                 { role: 'user', content: prompt }
             ],
             temperature: 0.1,
-            max_tokens: 4000,
+            max_tokens: 2000, // Reduced from 4000 to prevent 402 Insufficient Credits errors
         }),
     });
 
@@ -143,7 +149,7 @@ async function generateQuestionsWithAI(
     const provider: Provider = perSubjectProvider[subject.name] || (category === 'technical' ? 'openrouter' : 'perplexity');
 
     try {
-        let content = await callProvider(provider, subject, category);
+        let content = await callProvider(provider, subject, category, attempt);
 
         // Robust JSON extraction
         const jsonMatch = content.match(/\[\s*\{[\s\S]*\}\s*\]/);
