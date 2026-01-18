@@ -16,27 +16,27 @@ const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
 
 async function generateQuestionsWithAI(
     subject: Subject,
-    category: 'technical' | 'non_technical'
-) {
+    category: 'technical' | 'non_technical',
+    attempt = 1
+): Promise<any[]> {
     if (!PERPLEXITY_API_KEY) {
         throw new Error('PERPLEXITY_API_KEY is not configured');
     }
 
-    const prompt = `Generate ${subject.marks} multiple choice questions for the subject "${subject.name}" for an RRB JE (Railway Recruitment Board Junior Engineer) level examination.
-Focus on these topics: ${subject.topics.join(', ')}.
-The questions should be appropriate for ${category === 'technical' ? 'Technical (CS/IT)' : 'Non-Technical'} section.
+    const prompt = `Generate exactly ${subject.marks} multiple choice questions for "${subject.name}" (RRB JE level).
+Topics: ${subject.topics.join(', ')}.
+Section: ${category === 'technical' ? 'Technical (CS/IT)' : 'Non-Technical'}.
 
-Return ONLY a JSON array of objects with the following structure:
+CRITICAL: Return ONLY a JSON array of objects. No markdown, no text.
+Structure:
 [
   {
     "question_text": "string",
-    "options": { "a": "string", "b": "string", "c": "string", "d": "string" },
+    "options": { "a": "...", "b": "...", "c": "...", "d": "..." },
     "correct_answer": "a" | "b" | "c" | "d",
     "explanation": "string"
   }
-]
-
-Ensure the JSON is valid and contains exactly ${subject.marks} questions. Do not include any other text, markdown blocks, or explanation outside the JSON.`;
+]`;
 
     try {
         const response = await fetch('https://api.perplexity.ai/chat/completions', {
@@ -48,30 +48,32 @@ Ensure the JSON is valid and contains exactly ${subject.marks} questions. Do not
             body: JSON.stringify({
                 model: 'sonar',
                 messages: [
-                    { role: 'system', content: 'You are a professional educational content generator for RRB JE exams. You only output valid JSON.' },
+                    { role: 'system', content: 'You are a professional exam generator. You MUST output ONLY a valid JSON array. Do not include any text before or after the JSON.' },
                     { role: 'user', content: prompt }
                 ],
-                temperature: 0.2,
+                temperature: 0.1,
+                max_tokens: 4000,
             }),
         });
 
         if (!response.ok) {
             const errorData = await response.json().catch(() => ({}));
-            throw new Error(`Perplexity API error: ${response.status} ${JSON.stringify(errorData)}`);
+            throw new Error(`API ${response.status}: ${JSON.stringify(errorData)}`);
         }
 
         const data = await response.json();
-        let content = data.choices[0].message.content;
+        let content = data.choices[0].message.content.trim();
 
-        // Clean up content if it contains markdown code blocks
-        if (content.includes('```json')) {
-            content = content.split('```json')[1].split('```')[0];
-        } else if (content.includes('```')) {
-            content = content.split('```')[1].split('```')[0];
+        // More robust JSON extraction
+        const jsonMatch = content.match(/\[\s*\{[\s\S]*\}\s*\]/);
+        if (jsonMatch) {
+            content = jsonMatch[0];
         }
 
-        const questions = JSON.parse(content.trim());
-        return (Array.isArray(questions) ? questions : [questions]).map((q: any) => ({
+        const questions = JSON.parse(content);
+        const questionArray = Array.isArray(questions) ? questions : [questions];
+        
+        return questionArray.map((q: any) => ({
             ...q,
             category,
             subject: subject.name,
@@ -79,13 +81,20 @@ Ensure the JSON is valid and contains exactly ${subject.marks} questions. Do not
             marks: 1,
         }));
     } catch (e) {
-        console.error(`Error generating ${subject.name}:`, e);
-        // Fallback to minimal placeholder for this subject so entire paper doesn't fail
+        console.error(`Error generating ${subject.name} (Attempt ${attempt}):`, e);
+        
+        // Retry logic
+        if (attempt < 2) {
+            console.log(`Retrying ${subject.name}...`);
+            return generateQuestionsWithAI(subject, category, attempt + 1);
+        }
+
+        // Final Fallback
         return Array(subject.marks).fill(null).map((_, i) => ({
             question_text: `[AI Error] Could not generate question for ${subject.name}. Reference topic: ${subject.topics[i % subject.topics.length]}`,
             options: { a: 'A', b: 'B', c: 'C', d: 'D' },
             correct_answer: 'a' as const,
-            explanation: `Generation failed: ${e instanceof Error ? e.message : 'Unknown error'}`,
+            explanation: `Generation failed after ${attempt} attempts: ${e instanceof Error ? e.message : 'Unknown error'}`,
             category,
             subject: subject.name,
             difficulty: 'medium' as const,
