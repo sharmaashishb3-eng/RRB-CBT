@@ -12,35 +12,76 @@ interface GenerateRequest {
     nonTechnicalSubjects: Subject[];
 }
 
-// Question bank - imported separately to keep route clean
-import { getQuestionBank } from '@/lib/questionBank';
+const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
 
-async function generateQuestionsForSubject(
+async function generateQuestionsWithAI(
     subject: Subject,
     category: 'technical' | 'non_technical'
 ) {
-    const questions = [];
-    const bank = getQuestionBank();
-    const subjectBank = bank[subject.name] || [];
+    if (!PERPLEXITY_API_KEY) {
+        throw new Error('PERPLEXITY_API_KEY is not configured');
+    }
 
-    for (let i = 0; i < subject.marks; i++) {
-        const q = subjectBank[i % subjectBank.length] || {
-            question_text: `Question about ${subject.topics[i % subject.topics.length]} in ${subject.name}?`,
-            options: { a: 'Option A', b: 'Option B', c: 'Option C', d: 'Option D' },
-            correct_answer: 'a' as const,
-            explanation: 'This is an auto-generated question.',
-        };
+    const prompt = `Generate ${subject.marks} multiple choice questions for the subject "${subject.name}" for an RRB JE (Railway Recruitment Board Junior Engineer) level examination.
+Focus on these topics: ${subject.topics.join(', ')}.
+The questions should be appropriate for ${category === 'technical' ? 'Technical (CS/IT)' : 'Non-Technical'} section.
 
-        questions.push({
+Return ONLY a JSON array of objects with the following structure:
+[
+  {
+    "question_text": "string",
+    "options": { "a": "string", "b": "string", "c": "string", "d": "string" },
+    "correct_answer": "a" | "b" | "c" | "d",
+    "explanation": "string"
+  }
+]
+
+Ensure the JSON is valid and contains exactly ${subject.marks} questions. Do not include any other text, markdown blocks, or explanation outside the JSON.`;
+
+    const response = await fetch('https://api.perplexity.ai/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model: 'sonar',
+            messages: [
+                { role: 'system', content: 'You are a professional educational content generator for RRB JE exams. You only output valid JSON.' },
+                { role: 'user', content: prompt }
+            ],
+            temperature: 0.2,
+        }),
+    });
+
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(`Perplexity API error: ${response.status} ${JSON.stringify(errorData)}`);
+    }
+
+    const data = await response.json();
+    let content = data.choices[0].message.content;
+
+    // Clean up content if it contains markdown code blocks
+    if (content.includes('```json')) {
+        content = content.split('```json')[1].split('```')[0];
+    } else if (content.includes('```')) {
+        content = content.split('```')[1].split('```')[0];
+    }
+
+    try {
+        const questions = JSON.parse(content.trim());
+        return questions.map((q: any) => ({
             ...q,
             category,
             subject: subject.name,
-            difficulty: ['easy', 'medium', 'hard'][i % 3] as 'easy' | 'medium' | 'hard',
+            difficulty: 'medium' as const, // Defaulting to medium for AI generated
             marks: 1,
-        });
+        }));
+    } catch (e) {
+        console.error('Failed to parse AI response:', content);
+        throw new Error(`Failed to parse AI generated questions for ${subject.name}`);
     }
-
-    return questions;
 }
 
 export async function POST(request: NextRequest) {
@@ -50,16 +91,7 @@ export async function POST(request: NextRequest) {
         async start(controller) {
             try {
                 const { technicalSubjects, nonTechnicalSubjects }: GenerateRequest = await request.json();
-                const allQuestions: Array<{
-                    question_text: string;
-                    options: { a: string; b: string; c: string; d: string };
-                    correct_answer: 'a' | 'b' | 'c' | 'd';
-                    category: 'technical' | 'non_technical';
-                    subject: string;
-                    difficulty: 'easy' | 'medium' | 'hard';
-                    marks: number;
-                    explanation: string;
-                }> = [];
+                const allQuestions: any[] = [];
 
                 const total = technicalSubjects.length + nonTechnicalSubjects.length;
                 let done = 0;
@@ -68,22 +100,26 @@ export async function POST(request: NextRequest) {
                 for (const s of technicalSubjects) {
                     controller.enqueue(encoder.encode(JSON.stringify({
                         progress: (done / total) * 90,
-                        subject: `Generating ${s.name}...`
+                        subject: `AI is generating ${s.name} questions...`
                     }) + '\n'));
-                    allQuestions.push(...(await generateQuestionsForSubject(s, 'technical')));
+
+                    const questions = await generateQuestionsWithAI(s, 'technical');
+                    allQuestions.push(...questions);
+
                     done++;
-                    await new Promise(r => setTimeout(r, 50));
                 }
 
                 // Non-technical
                 for (const s of nonTechnicalSubjects) {
                     controller.enqueue(encoder.encode(JSON.stringify({
                         progress: (done / total) * 90,
-                        subject: `Generating ${s.name}...`
+                        subject: `AI is generating ${s.name} questions...`
                     }) + '\n'));
-                    allQuestions.push(...(await generateQuestionsForSubject(s, 'non_technical')));
+
+                    const questions = await generateQuestionsWithAI(s, 'non_technical');
+                    allQuestions.push(...questions);
+
                     done++;
-                    await new Promise(r => setTimeout(r, 50));
                 }
 
                 // Shuffle
@@ -91,10 +127,10 @@ export async function POST(request: NextRequest) {
 
                 // Save
                 controller.enqueue(encoder.encode(JSON.stringify({
-                    progress: 95, subject: 'Saving...', status: 'saving'
+                    progress: 95, subject: 'Saving to database...', status: 'saving'
                 }) + '\n'));
 
-                const title = `RRB JE Mock - ${new Date().toLocaleDateString('en-IN')}`;
+                const title = `RRB JE AI Mock - ${new Date().toLocaleDateString('en-IN')}`;
                 const { paper, error } = await saveQuestionPaper(title, shuffled, 100, 90);
 
                 if (error) throw error;
@@ -103,8 +139,9 @@ export async function POST(request: NextRequest) {
                     progress: 100, status: 'complete', paperId: paper?.id
                 }) + '\n'));
             } catch (e) {
+                console.error('Generation Error:', e);
                 controller.enqueue(encoder.encode(JSON.stringify({
-                    error: e instanceof Error ? e.message : 'Failed'
+                    error: e instanceof Error ? e.message : 'Generation failed'
                 }) + '\n'));
             } finally {
                 controller.close();
