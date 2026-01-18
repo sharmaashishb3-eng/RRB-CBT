@@ -35,7 +35,7 @@ async function generateQuestionsForSubject(
             ...q,
             category,
             subject: subject.name,
-            difficulty: ['easy', 'medium', 'hard'][i % 3],
+            difficulty: ['easy', 'medium', 'hard'][i % 3] as 'easy' | 'medium' | 'hard',
             marks: 1,
         });
     }
