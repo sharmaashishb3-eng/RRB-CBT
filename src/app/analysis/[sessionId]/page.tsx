@@ -88,7 +88,7 @@ export default function AnalysisPage() {
                                     const isCorrect = q.correct_answer === opt;
 
                                     let className = 'glass-card';
-                                    let style = { padding: 'var(--space-4)', border: '1px solid transparent' };
+                                    const style: React.CSSProperties = { padding: 'var(--space-4)', border: '1px solid transparent' };
 
                                     if (isCorrect) {
                                         style.border = '1px solid var(--color-success)';
