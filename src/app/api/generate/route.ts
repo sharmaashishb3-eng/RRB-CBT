@@ -38,49 +38,59 @@ Return ONLY a JSON array of objects with the following structure:
 
 Ensure the JSON is valid and contains exactly ${subject.marks} questions. Do not include any other text, markdown blocks, or explanation outside the JSON.`;
 
-    const response = await fetch('https://api.perplexity.ai/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            model: 'sonar',
-            messages: [
-                { role: 'system', content: 'You are a professional educational content generator for RRB JE exams. You only output valid JSON.' },
-                { role: 'user', content: prompt }
-            ],
-            temperature: 0.2,
-        }),
-    });
-
-    if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(`Perplexity API error: ${response.status} ${JSON.stringify(errorData)}`);
-    }
-
-    const data = await response.json();
-    let content = data.choices[0].message.content;
-
-    // Clean up content if it contains markdown code blocks
-    if (content.includes('```json')) {
-        content = content.split('```json')[1].split('```')[0];
-    } else if (content.includes('```')) {
-        content = content.split('```')[1].split('```')[0];
-    }
-
     try {
+        const response = await fetch('https://api.perplexity.ai/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: 'sonar',
+                messages: [
+                    { role: 'system', content: 'You are a professional educational content generator for RRB JE exams. You only output valid JSON.' },
+                    { role: 'user', content: prompt }
+                ],
+                temperature: 0.2,
+            }),
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(`Perplexity API error: ${response.status} ${JSON.stringify(errorData)}`);
+        }
+
+        const data = await response.json();
+        let content = data.choices[0].message.content;
+
+        // Clean up content if it contains markdown code blocks
+        if (content.includes('```json')) {
+            content = content.split('```json')[1].split('```')[0];
+        } else if (content.includes('```')) {
+            content = content.split('```')[1].split('```')[0];
+        }
+
         const questions = JSON.parse(content.trim());
-        return questions.map((q: any) => ({
+        return (Array.isArray(questions) ? questions : [questions]).map((q: any) => ({
             ...q,
             category,
             subject: subject.name,
-            difficulty: 'medium' as const, // Defaulting to medium for AI generated
+            difficulty: 'medium' as const,
             marks: 1,
         }));
     } catch (e) {
-        console.error('Failed to parse AI response:', content);
-        throw new Error(`Failed to parse AI generated questions for ${subject.name}`);
+        console.error(`Error generating ${subject.name}:`, e);
+        // Fallback to minimal placeholder for this subject so entire paper doesn't fail
+        return Array(subject.marks).fill(null).map((_, i) => ({
+            question_text: `[AI Error] Could not generate question for ${subject.name}. Reference topic: ${subject.topics[i % subject.topics.length]}`,
+            options: { a: 'A', b: 'B', c: 'C', d: 'D' },
+            correct_answer: 'a' as const,
+            explanation: `Generation failed: ${e instanceof Error ? e.message : 'Unknown error'}`,
+            category,
+            subject: subject.name,
+            difficulty: 'medium' as const,
+            marks: 1,
+        }));
     }
 }
 
@@ -91,36 +101,32 @@ export async function POST(request: NextRequest) {
         async start(controller) {
             try {
                 const { technicalSubjects, nonTechnicalSubjects }: GenerateRequest = await request.json();
-                const allQuestions: any[] = [];
 
-                const total = technicalSubjects.length + nonTechnicalSubjects.length;
-                let done = 0;
+                controller.enqueue(encoder.encode(JSON.stringify({
+                    progress: 10,
+                    subject: 'Starting parallel generation...'
+                }) + '\n'));
 
-                // Technical
-                for (const s of technicalSubjects) {
+                // Fire all requests in parallel
+                const techPromises = technicalSubjects.map(s =>
+                    generateQuestionsWithAI(s, 'technical')
+                );
+                const nonTechPromises = nonTechnicalSubjects.map(s =>
+                    generateQuestionsWithAI(s, 'non_technical')
+                );
+
+                // Update progress while waiting
+                const waitInterval = setInterval(() => {
                     controller.enqueue(encoder.encode(JSON.stringify({
-                        progress: (done / total) * 90,
-                        subject: `AI is generating ${s.name} questions...`
+                        progress: 10 + Math.random() * 70, // Fake progress for visual feedback
+                        subject: 'AI is processing multiple subjects simultaneously...'
                     }) + '\n'));
+                }, 2000);
 
-                    const questions = await generateQuestionsWithAI(s, 'technical');
-                    allQuestions.push(...questions);
+                const results = await Promise.all([...techPromises, ...nonTechPromises]);
+                clearInterval(waitInterval);
 
-                    done++;
-                }
-
-                // Non-technical
-                for (const s of nonTechnicalSubjects) {
-                    controller.enqueue(encoder.encode(JSON.stringify({
-                        progress: (done / total) * 90,
-                        subject: `AI is generating ${s.name} questions...`
-                    }) + '\n'));
-
-                    const questions = await generateQuestionsWithAI(s, 'non_technical');
-                    allQuestions.push(...questions);
-
-                    done++;
-                }
+                const allQuestions = results.flat();
 
                 // Shuffle
                 const shuffled = [...allQuestions].sort(() => Math.random() - 0.5);
@@ -153,3 +159,4 @@ export async function POST(request: NextRequest) {
         headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     });
 }
+
