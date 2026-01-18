@@ -56,7 +56,7 @@ export async function POST(request: NextRequest) {
                     correct_answer: 'a' | 'b' | 'c' | 'd';
                     category: 'technical' | 'non_technical';
                     subject: string;
-                    difficulty: string;
+                    difficulty: 'easy' | 'medium' | 'hard';
                     marks: number;
                     explanation: string;
                 }> = [];
