@@ -13,9 +13,9 @@ interface GenerateRequest {
 }
 
 const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-type Provider = 'perplexity' | 'openrouter';
+type Provider = 'perplexity' | 'google';
 
 async function callProvider(
     provider: Provider,
@@ -24,18 +24,15 @@ async function callProvider(
     attempt: number
 ) {
     const isPerplexity = provider === 'perplexity';
-    const apiKey = isPerplexity ? PERPLEXITY_API_KEY : OPENROUTER_API_KEY;
-    const url = isPerplexity
-        ? 'https://api.perplexity.ai/chat/completions'
-        : 'https://openrouter.ai/api/v1/chat/completions';
+    const isGoogle = provider === 'google';
 
-    // 3-Tier Model Rotation to handle Credits (Error 402) and Rate Limits
-    const models = isPerplexity
-        ? ['sonar', 'sonar-pro']
-        : ['anthropic/claude-3.5-sonnet', 'meta-llama/llama-3.1-70b-instruct', 'meta-llama/llama-3.1-8b-instruct'];
-
-    // Choose model based on attempt number (1-indexed)
-    const model = models[(attempt - 1) % models.length];
+    // Model Selection
+    let model = '';
+    if (isPerplexity) {
+        model = attempt === 1 ? 'sonar' : 'sonar-pro';
+    } else { // isGoogle
+        model = 'gemini-1.5-flash';
+    }
 
     const prompt = `Generate exactly ${subject.marks} multiple choice questions for "${subject.name}" (RRB JE level).
 Topics: ${subject.topics.join(', ')}.
@@ -50,19 +47,45 @@ Structure PER QUESTION:
   "explanation": "detailed explanation"
 }`;
 
-    const headers: Record<string, string> = {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-    };
+    if (isGoogle) {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: {
+                    temperature: 0.1,
+                    maxOutputTokens: 2048,
+                    responseMimeType: "application/json"
+                },
+                safetySettings: [
+                    { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                    { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                    { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                    { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+                ],
+            }),
+        });
 
-    if (provider === 'openrouter') {
-        headers['HTTP-Referer'] = 'http://localhost:3000';
-        headers['X-Title'] = 'RRB-JE-CBT';
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(`GOOGLE API ${response.status}: ${JSON.stringify(errorData)}`);
+        }
+
+        const data = await response.json();
+        const content = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '[]';
+        return content;
     }
 
+    // Perplexity (OpenAI-compatible)
+    const url = 'https://api.perplexity.ai/chat/completions';
     const response = await fetch(url, {
         method: 'POST',
-        headers,
+        headers: {
+            'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
+            'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
             model,
             messages: [
@@ -70,17 +93,17 @@ Structure PER QUESTION:
                 { role: 'user', content: prompt }
             ],
             temperature: 0.1,
-            max_tokens: 2000, // Reduced from 4000 to prevent 402 Insufficient Credits errors
+            max_tokens: 3000,
         }),
     });
 
     if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        throw new Error(`${provider.toUpperCase()} API ${response.status}: ${JSON.stringify(errorData)}`);
+        throw new Error(`PERPLEXITY API ${response.status}: ${JSON.stringify(errorData)}`);
     }
 
     const data = await response.json();
-    return data.choices[0].message.content.trim();
+    return data.choices?.[0]?.message?.content?.trim() || '[]';
 }
 
 function normalizeQuestions(questions: any[], subjectName: string, category: string) {
@@ -106,7 +129,7 @@ function normalizeQuestions(questions: any[], subjectName: string, category: str
                 d: String(opts.d || opts.D || '')
             };
         } else {
-            opts = { a: 'A', b: 'B', c: 'C', d: 'D' };
+            opts = { a: 'Option A', b: 'Option B', c: 'Option C', d: 'Option D' };
         }
 
         // Handle case-insensitive correct_answer
@@ -138,15 +161,19 @@ async function generateQuestionsWithAI(
     category: 'technical' | 'non_technical',
     attempt = 1
 ): Promise<any[]> {
-    // Orchestration Logic: Map subjects to providers
-    const perSubjectProvider: Record<string, Provider> = {
+    // 1st Attempt: Use Preferred Provider
+    // 2nd Attempt: Use Fallback Provider
+    const preferredProviders: Record<string, Provider> = {
         'Reasoning': 'perplexity',
         'English Language': 'perplexity',
-        'General Studies/GK': 'perplexity',
-        'Mathematics': 'openrouter',
+        'General Studies/GK': 'perplexity'
     };
 
-    const provider: Provider = perSubjectProvider[subject.name] || (category === 'technical' ? 'openrouter' : 'perplexity');
+    let provider: Provider = preferredProviders[subject.name] || 'google';
+
+    if (attempt > 1) {
+        provider = provider === 'google' ? 'perplexity' : 'google';
+    }
 
     try {
         let content = await callProvider(provider, subject, category, attempt);
@@ -162,20 +189,17 @@ async function generateQuestionsWithAI(
     } catch (e) {
         console.error(`Error generating ${subject.name} via ${provider} (Attempt ${attempt}):`, e);
 
-        // Multi-Model Fallback: Try next tier if primary fails
-        if (attempt < 3) {
-            const delay = attempt * 500; // Small progressive delay
-            await new Promise(r => setTimeout(r, delay));
-            console.log(`Retrying ${subject.name} (Attempt ${attempt + 1})...`);
+        if (attempt < 2) {
+            await new Promise(r => setTimeout(r, 1000));
             return generateQuestionsWithAI(subject, category, attempt + 1);
         }
 
         // Final Fallback: Structural placeholder to keep the paper alive
         return Array(subject.marks).fill(null).map((_, i) => ({
             question_text: `[AI Error] Could not generate question for ${subject.name}. Reference topic: ${subject.topics[i % subject.topics.length]}`,
-            options: { a: 'Check documentation', b: 'Review syllabus', c: 'Contact support', d: 'Retry generation' },
+            options: { a: 'A', b: 'B', c: 'C', d: 'D' },
             correct_answer: 'a',
-            explanation: `Generation failed after ${attempt} attempts on multiple providers. Error: ${e instanceof Error ? e.message : 'Unknown error'}`,
+            explanation: `Generation failed: ${e instanceof Error ? e.message : 'Unknown error'}`,
             category,
             subject: subject.name,
             difficulty: 'medium' as const,
@@ -191,58 +215,50 @@ export async function POST(request: NextRequest) {
         async start(controller) {
             try {
                 const { technicalSubjects, nonTechnicalSubjects }: GenerateRequest = await request.json();
-
-                controller.enqueue(encoder.encode(JSON.stringify({
-                    progress: 5,
-                    subject: 'Orchestrating Multi-AI generation...'
-                }) + '\n'));
-
-                // Fire all requests in parallel across both providers
-                const allPromises = [
-                    ...technicalSubjects.map(s => generateQuestionsWithAI(s, 'technical')),
-                    ...nonTechnicalSubjects.map(s => generateQuestionsWithAI(s, 'non_technical'))
+                const allRequested = [
+                    ...technicalSubjects.map(s => ({ ...s, cat: 'technical' })),
+                    ...nonTechnicalSubjects.map(s => ({ ...s, cat: 'non_technical' }))
                 ];
 
-                const waitInterval = setInterval(() => {
+                controller.enqueue(encoder.encode(JSON.stringify({ progress: 5, subject: 'Initializing Batch Generation...' }) + '\n'));
+
+                let allQuestions: any[] = [];
+                const batchSize = 3; // Processing subjects in batches of 3 to balance speed and reliability
+
+                for (let i = 0; i < allRequested.length; i += batchSize) {
+                    const batch = allRequested.slice(i, i + batchSize);
+                    const progress = Math.round(5 + (i / allRequested.length) * 85);
+
                     controller.enqueue(encoder.encode(JSON.stringify({
-                        progress: 10 + Math.random() * 80,
-                        subject: 'Claude & Perplexity are collaborating on your paper...'
+                        progress,
+                        subject: `Generating Batch: ${batch.map(s => s.name).join(', ')}...`
                     }) + '\n'));
-                }, 2000);
 
-                const results = await Promise.all(allPromises);
-                clearInterval(waitInterval);
+                    const batchPromises = batch.map(s =>
+                        generateQuestionsWithAI(s as Subject, s.cat as 'technical' | 'non_technical')
+                    );
 
-                const allQuestions = results.flat();
+                    const batchResults = await Promise.all(batchPromises);
+                    allQuestions = allQuestions.concat(batchResults.flat());
+                }
 
-                // Shuffle for random distribution
                 const shuffled = [...allQuestions].sort(() => Math.random() - 0.5);
+                const title = `RRB JE CBT AI Mock - ${new Date().toLocaleDateString('en-IN')}`;
 
-                const title = `RRB JE Multi-AI Mock - ${new Date().toLocaleDateString('en-IN')}`;
-
-                controller.enqueue(encoder.encode(JSON.stringify({
-                    progress: 95, subject: 'Finalizing paper structure...', status: 'saving'
-                }) + '\n'));
+                controller.enqueue(encoder.encode(JSON.stringify({ progress: 95, subject: 'Deep-saving questions...', status: 'saving' }) + '\n'));
 
                 const { paper, error } = await saveQuestionPaper(title, shuffled, 100, 90);
-
                 if (error) throw error;
 
-                controller.enqueue(encoder.encode(JSON.stringify({
-                    progress: 100, status: 'complete', paperId: paper?.id
-                }) + '\n'));
+                controller.enqueue(encoder.encode(JSON.stringify({ progress: 100, status: 'complete', paperId: paper?.id }) + '\n'));
             } catch (e) {
-                console.error('Orchestration Error:', e);
-                controller.enqueue(encoder.encode(JSON.stringify({
-                    error: e instanceof Error ? e.message : 'Orchestration failed'
-                }) + '\n'));
+                console.error('Batch Generation Error:', e);
+                controller.enqueue(encoder.encode(JSON.stringify({ error: e instanceof Error ? e.message : 'Generation failed' }) + '\n'));
             } finally {
                 controller.close();
             }
         }
     });
 
-    return new NextResponse(stream, {
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-    });
+    return new NextResponse(stream, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
 }
