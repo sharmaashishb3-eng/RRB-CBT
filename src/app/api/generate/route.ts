@@ -28,22 +28,21 @@ async function callProvider(
         ? 'https://api.perplexity.ai/chat/completions'
         : 'https://openrouter.ai/api/v1/chat/completions';
 
-    const model = isPerplexity ? 'sonar' : 'meta-llama/llama-3.1-405b-instruct';
+    // Claude 3.5 Sonnet is the gold standard for high-accuracy JSON generation
+    const model = isPerplexity ? 'sonar' : 'anthropic/claude-3.5-sonnet';
 
     const prompt = `Generate exactly ${subject.marks} multiple choice questions for "${subject.name}" (RRB JE level).
 Topics: ${subject.topics.join(', ')}.
 Section: ${category === 'technical' ? 'Technical (CS/IT)' : 'Non-Technical'}.
 
 CRITICAL: Return ONLY a JSON array of objects. No markdown, no text.
-Structure:
-[
-  {
-    "question_text": "string",
-    "options": { "a": "...", "b": "...", "c": "...", "d": "..." },
-    "correct_answer": "a" | "b" | "c" | "d",
-    "explanation": "string"
-  }
-]`;
+Structure PER QUESTION:
+{
+  "question_text": "the question text here",
+  "options": { "a": "option 1", "b": "option 2", "c": "option 3", "d": "option 4" },
+  "correct_answer": "a",
+  "explanation": "detailed explanation"
+}`;
 
     const headers: Record<string, string> = {
         'Authorization': `Bearer ${apiKey}`,
@@ -61,7 +60,7 @@ Structure:
         body: JSON.stringify({
             model,
             messages: [
-                { role: 'system', content: 'You are a professional exam generator. You MUST output ONLY a valid JSON array. Do not include any text before or after the JSON.' },
+                { role: 'system', content: 'You are a professional exam generator for RRB JE. You MUST output ONLY a valid JSON array. Always use the specified keys: question_text, options (as object with keys a,b,c,d), correct_answer, explanation.' },
                 { role: 'user', content: prompt }
             ],
             temperature: 0.1,
@@ -76,6 +75,56 @@ Structure:
 
     const data = await response.json();
     return data.choices[0].message.content.trim();
+}
+
+function normalizeQuestions(questions: any[], subjectName: string, category: string) {
+    return (Array.isArray(questions) ? questions : [questions]).map((q: any) => {
+        // Handle 'question' vs 'question_text'
+        const text = q.question_text || q.question || q.text || 'Question text missing';
+
+        // Handle options as array [opt1, opt2, opt3, opt4] or object
+        let opts = q.options;
+        if (Array.isArray(opts)) {
+            opts = {
+                a: String(opts[0] || ''),
+                b: String(opts[1] || ''),
+                c: String(opts[2] || ''),
+                d: String(opts[3] || '')
+            };
+        } else if (typeof opts === 'object' && opts !== null) {
+            // Ensure all keys exist
+            opts = {
+                a: String(opts.a || opts.A || ''),
+                b: String(opts.b || opts.B || ''),
+                c: String(opts.c || opts.C || ''),
+                d: String(opts.d || opts.D || '')
+            };
+        } else {
+            opts = { a: 'A', b: 'B', c: 'C', d: 'D' };
+        }
+
+        // Handle case-insensitive correct_answer
+        const correct = String(q.correct_answer || q.answer || 'a').toLowerCase().trim();
+        const validAnswers = ['a', 'b', 'c', 'd'];
+        let correctKey = 'a';
+        for (const key of validAnswers) {
+            if (correct.includes(key)) {
+                correctKey = key;
+                break;
+            }
+        }
+
+        return {
+            question_text: text,
+            options: opts,
+            correct_answer: correctKey,
+            explanation: q.explanation || q.reason || 'No explanation provided.',
+            category,
+            subject: subjectName,
+            difficulty: 'medium' as const,
+            marks: 1,
+        };
+    });
 }
 
 async function generateQuestionsWithAI(
@@ -103,31 +152,23 @@ async function generateQuestionsWithAI(
         }
 
         const questions = JSON.parse(content);
-        const questionArray = Array.isArray(questions) ? questions : [questions];
-
-        return questionArray.map((q: any) => ({
-            ...q,
-            category,
-            subject: subject.name,
-            difficulty: 'medium' as const,
-            marks: 1,
-        }));
+        return normalizeQuestions(questions, subject.name, category);
     } catch (e) {
         console.error(`Error generating ${subject.name} via ${provider} (Attempt ${attempt}):`, e);
 
-        // Multi-Model Fallback: Try the other provider if primary fails
+        // Multi-Model Fallback: Try the other provider as fallback if primary fails
         if (attempt < 2) {
             const fallbackProvider: Provider = provider === 'perplexity' ? 'openrouter' : 'perplexity';
             console.log(`Retrying ${subject.name} with ${fallbackProvider}...`);
             return generateQuestionsWithAI(subject, category, attempt + 1);
         }
 
-        // Final Fallback if both fail
+        // Final Fallback: Structural placeholder to keep the paper alive
         return Array(subject.marks).fill(null).map((_, i) => ({
             question_text: `[AI Error] Could not generate question for ${subject.name}. Reference topic: ${subject.topics[i % subject.topics.length]}`,
-            options: { a: 'A', b: 'B', c: 'C', d: 'D' },
-            correct_answer: 'a' as const,
-            explanation: `Generation failed after ${attempt} attempts on multiple models: ${e instanceof Error ? e.message : 'Unknown error'}`,
+            options: { a: 'Check documentation', b: 'Review syllabus', c: 'Contact support', d: 'Retry generation' },
+            correct_answer: 'a',
+            explanation: `Generation failed after ${attempt} attempts on multiple providers. Error: ${e instanceof Error ? e.message : 'Unknown error'}`,
             category,
             subject: subject.name,
             difficulty: 'medium' as const,
@@ -145,7 +186,7 @@ export async function POST(request: NextRequest) {
                 const { technicalSubjects, nonTechnicalSubjects }: GenerateRequest = await request.json();
 
                 controller.enqueue(encoder.encode(JSON.stringify({
-                    progress: 10,
+                    progress: 5,
                     subject: 'Orchestrating Multi-AI generation...'
                 }) + '\n'));
 
@@ -157,23 +198,23 @@ export async function POST(request: NextRequest) {
 
                 const waitInterval = setInterval(() => {
                     controller.enqueue(encoder.encode(JSON.stringify({
-                        progress: 10 + Math.random() * 70,
-                        subject: 'Perplexity & OpenRouter are working together...'
+                        progress: 10 + Math.random() * 80,
+                        subject: 'Claude & Perplexity are collaborating on your paper...'
                     }) + '\n'));
-                }, 1500);
+                }, 2000);
 
                 const results = await Promise.all(allPromises);
                 clearInterval(waitInterval);
 
                 const allQuestions = results.flat();
 
-                // Shuffle
+                // Shuffle for random distribution
                 const shuffled = [...allQuestions].sort(() => Math.random() - 0.5);
 
                 const title = `RRB JE Multi-AI Mock - ${new Date().toLocaleDateString('en-IN')}`;
 
                 controller.enqueue(encoder.encode(JSON.stringify({
-                    progress: 95, subject: 'Finalizing paper...', status: 'saving'
+                    progress: 95, subject: 'Finalizing paper structure...', status: 'saving'
                 }) + '\n'));
 
                 const { paper, error } = await saveQuestionPaper(title, shuffled, 100, 90);
