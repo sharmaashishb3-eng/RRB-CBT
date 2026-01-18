@@ -30,11 +30,11 @@ async function callProvider(
         : 'https://openrouter.ai/api/v1/chat/completions';
 
     // 3-Tier Model Rotation to handle Credits (Error 402) and Rate Limits
-    const models = isPerplexity 
-        ? ['sonar'] 
-        : ['anthropic/claude-3.5-sonnet', 'google/gemini-flash-1.5', 'meta-llama/llama-3.1-8b-instruct'];
-    
-    // Use attempt to rotate models if needed
+    const models = isPerplexity
+        ? ['sonar', 'sonar-pro']
+        : ['anthropic/claude-3.5-sonnet', 'meta-llama/llama-3.1-70b-instruct', 'meta-llama/llama-3.1-8b-instruct'];
+
+    // Choose model based on attempt number (1-indexed)
     const model = models[(attempt - 1) % models.length];
 
     const prompt = `Generate exactly ${subject.marks} multiple choice questions for "${subject.name}" (RRB JE level).
@@ -162,10 +162,11 @@ async function generateQuestionsWithAI(
     } catch (e) {
         console.error(`Error generating ${subject.name} via ${provider} (Attempt ${attempt}):`, e);
 
-        // Multi-Model Fallback: Try the other provider as fallback if primary fails
-        if (attempt < 2) {
-            const fallbackProvider: Provider = provider === 'perplexity' ? 'openrouter' : 'perplexity';
-            console.log(`Retrying ${subject.name} with ${fallbackProvider}...`);
+        // Multi-Model Fallback: Try next tier if primary fails
+        if (attempt < 3) {
+            const delay = attempt * 500; // Small progressive delay
+            await new Promise(r => setTimeout(r, delay));
+            console.log(`Retrying ${subject.name} (Attempt ${attempt + 1})...`);
             return generateQuestionsWithAI(subject, category, attempt + 1);
         }
 
