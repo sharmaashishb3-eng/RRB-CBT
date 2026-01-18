@@ -13,15 +13,22 @@ interface GenerateRequest {
 }
 
 const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
-async function generateQuestionsWithAI(
+type Provider = 'perplexity' | 'openrouter';
+
+async function callProvider(
+    provider: Provider,
     subject: Subject,
-    category: 'technical' | 'non_technical',
-    attempt = 1
-): Promise<any[]> {
-    if (!PERPLEXITY_API_KEY) {
-        throw new Error('PERPLEXITY_API_KEY is not configured');
-    }
+    category: 'technical' | 'non_technical'
+) {
+    const isPerplexity = provider === 'perplexity';
+    const apiKey = isPerplexity ? PERPLEXITY_API_KEY : OPENROUTER_API_KEY;
+    const url = isPerplexity
+        ? 'https://api.perplexity.ai/chat/completions'
+        : 'https://openrouter.ai/api/v1/chat/completions';
+
+    const model = isPerplexity ? 'sonar' : 'meta-llama/llama-3.1-405b-instruct';
 
     const prompt = `Generate exactly ${subject.marks} multiple choice questions for "${subject.name}" (RRB JE level).
 Topics: ${subject.topics.join(', ')}.
@@ -38,33 +45,58 @@ Structure:
   }
 ]`;
 
+    const headers: Record<string, string> = {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+    };
+
+    if (provider === 'openrouter') {
+        headers['HTTP-Referer'] = 'http://localhost:3000';
+        headers['X-Title'] = 'RRB-JE-CBT';
+    }
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+            model,
+            messages: [
+                { role: 'system', content: 'You are a professional exam generator. You MUST output ONLY a valid JSON array. Do not include any text before or after the JSON.' },
+                { role: 'user', content: prompt }
+            ],
+            temperature: 0.1,
+            max_tokens: 4000,
+        }),
+    });
+
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(`${provider.toUpperCase()} API ${response.status}: ${JSON.stringify(errorData)}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content.trim();
+}
+
+async function generateQuestionsWithAI(
+    subject: Subject,
+    category: 'technical' | 'non_technical',
+    attempt = 1
+): Promise<any[]> {
+    // Orchestration Logic: Map subjects to providers
+    const perSubjectProvider: Record<string, Provider> = {
+        'Reasoning': 'perplexity',
+        'English Language': 'perplexity',
+        'General Studies/GK': 'perplexity',
+        'Mathematics': 'openrouter',
+    };
+
+    const provider: Provider = perSubjectProvider[subject.name] || (category === 'technical' ? 'openrouter' : 'perplexity');
+
     try {
-        const response = await fetch('https://api.perplexity.ai/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model: 'sonar',
-                messages: [
-                    { role: 'system', content: 'You are a professional exam generator. You MUST output ONLY a valid JSON array. Do not include any text before or after the JSON.' },
-                    { role: 'user', content: prompt }
-                ],
-                temperature: 0.1,
-                max_tokens: 4000,
-            }),
-        });
+        let content = await callProvider(provider, subject, category);
 
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(`API ${response.status}: ${JSON.stringify(errorData)}`);
-        }
-
-        const data = await response.json();
-        let content = data.choices[0].message.content.trim();
-
-        // More robust JSON extraction
+        // Robust JSON extraction
         const jsonMatch = content.match(/\[\s*\{[\s\S]*\}\s*\]/);
         if (jsonMatch) {
             content = jsonMatch[0];
@@ -72,7 +104,7 @@ Structure:
 
         const questions = JSON.parse(content);
         const questionArray = Array.isArray(questions) ? questions : [questions];
-        
+
         return questionArray.map((q: any) => ({
             ...q,
             category,
@@ -81,20 +113,21 @@ Structure:
             marks: 1,
         }));
     } catch (e) {
-        console.error(`Error generating ${subject.name} (Attempt ${attempt}):`, e);
-        
-        // Retry logic
+        console.error(`Error generating ${subject.name} via ${provider} (Attempt ${attempt}):`, e);
+
+        // Multi-Model Fallback: Try the other provider if primary fails
         if (attempt < 2) {
-            console.log(`Retrying ${subject.name}...`);
+            const fallbackProvider: Provider = provider === 'perplexity' ? 'openrouter' : 'perplexity';
+            console.log(`Retrying ${subject.name} with ${fallbackProvider}...`);
             return generateQuestionsWithAI(subject, category, attempt + 1);
         }
 
-        // Final Fallback
+        // Final Fallback if both fail
         return Array(subject.marks).fill(null).map((_, i) => ({
             question_text: `[AI Error] Could not generate question for ${subject.name}. Reference topic: ${subject.topics[i % subject.topics.length]}`,
             options: { a: 'A', b: 'B', c: 'C', d: 'D' },
             correct_answer: 'a' as const,
-            explanation: `Generation failed after ${attempt} attempts: ${e instanceof Error ? e.message : 'Unknown error'}`,
+            explanation: `Generation failed after ${attempt} attempts on multiple models: ${e instanceof Error ? e.message : 'Unknown error'}`,
             category,
             subject: subject.name,
             difficulty: 'medium' as const,
@@ -113,26 +146,23 @@ export async function POST(request: NextRequest) {
 
                 controller.enqueue(encoder.encode(JSON.stringify({
                     progress: 10,
-                    subject: 'Starting parallel generation...'
+                    subject: 'Orchestrating Multi-AI generation...'
                 }) + '\n'));
 
-                // Fire all requests in parallel
-                const techPromises = technicalSubjects.map(s =>
-                    generateQuestionsWithAI(s, 'technical')
-                );
-                const nonTechPromises = nonTechnicalSubjects.map(s =>
-                    generateQuestionsWithAI(s, 'non_technical')
-                );
+                // Fire all requests in parallel across both providers
+                const allPromises = [
+                    ...technicalSubjects.map(s => generateQuestionsWithAI(s, 'technical')),
+                    ...nonTechnicalSubjects.map(s => generateQuestionsWithAI(s, 'non_technical'))
+                ];
 
-                // Update progress while waiting
                 const waitInterval = setInterval(() => {
                     controller.enqueue(encoder.encode(JSON.stringify({
-                        progress: 10 + Math.random() * 70, // Fake progress for visual feedback
-                        subject: 'AI is processing multiple subjects simultaneously...'
+                        progress: 10 + Math.random() * 70,
+                        subject: 'Perplexity & OpenRouter are working together...'
                     }) + '\n'));
-                }, 2000);
+                }, 1500);
 
-                const results = await Promise.all([...techPromises, ...nonTechPromises]);
+                const results = await Promise.all(allPromises);
                 clearInterval(waitInterval);
 
                 const allQuestions = results.flat();
@@ -140,12 +170,12 @@ export async function POST(request: NextRequest) {
                 // Shuffle
                 const shuffled = [...allQuestions].sort(() => Math.random() - 0.5);
 
-                // Save
+                const title = `RRB JE Multi-AI Mock - ${new Date().toLocaleDateString('en-IN')}`;
+
                 controller.enqueue(encoder.encode(JSON.stringify({
-                    progress: 95, subject: 'Saving to database...', status: 'saving'
+                    progress: 95, subject: 'Finalizing paper...', status: 'saving'
                 }) + '\n'));
 
-                const title = `RRB JE AI Mock - ${new Date().toLocaleDateString('en-IN')}`;
                 const { paper, error } = await saveQuestionPaper(title, shuffled, 100, 90);
 
                 if (error) throw error;
@@ -154,9 +184,9 @@ export async function POST(request: NextRequest) {
                     progress: 100, status: 'complete', paperId: paper?.id
                 }) + '\n'));
             } catch (e) {
-                console.error('Generation Error:', e);
+                console.error('Orchestration Error:', e);
                 controller.enqueue(encoder.encode(JSON.stringify({
-                    error: e instanceof Error ? e.message : 'Generation failed'
+                    error: e instanceof Error ? e.message : 'Orchestration failed'
                 }) + '\n'));
             } finally {
                 controller.close();
@@ -168,4 +198,3 @@ export async function POST(request: NextRequest) {
         headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     });
 }
-
