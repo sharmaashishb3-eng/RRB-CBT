@@ -47,7 +47,7 @@ export interface ExamSession {
 // CRUD Operations for Question Papers
 export async function saveQuestionPaper(
     title: string,
-    questions: Omit<Question, 'id' | 'paper_id'>[],
+    questions: Omit<Question, 'id' | 'paper_id' | 'question_number'>[],
     totalMarks: number = 100,
     durationMinutes: number = 90
 ): Promise<{ paper: QuestionPaper | null; error: Error | null }> {
